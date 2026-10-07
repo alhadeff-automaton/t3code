@@ -78,7 +78,7 @@ export const COMMON_DEV_PORTS: ReadonlyArray<number> = Object.freeze([
 const POLL_INTERVAL = Duration.seconds(3);
 const LSOF_TIMEOUT_MS = 5_000;
 const WINDOWS_LISTENER_TIMEOUT_MS = 15_000;
-const WINDOWS_FALLBACK_MAX_RETRY_MS = 60_000;
+const WINDOWS_DISCOVERY_MAX_RETRY_MS = 60_000;
 const WINDOWS_LISTENER_COMMAND =
   '$m = @{}; Get-Process | ForEach-Object { $m[$_.Id] = $_.ProcessName }; Get-NetTCPConnection -State Listen -ErrorAction Stop | ForEach-Object { Write-Output "$($_.LocalAddress)|$($_.LocalPort)|$($_.OwningProcess)|$($m[[int]$_.OwningProcess])" }';
 const WEB_PROBE_TIMEOUT = Duration.seconds(1);
@@ -301,14 +301,14 @@ const withCurrentTerminalOwners = (
     terminal: server.pid === null ? null : (terminalByProcessId.get(server.pid) ?? null),
   }));
 
-function windowsFallbackRetryDelayMs(failureCount: number): number {
-  return Math.min(3_000 * 2 ** Math.max(0, failureCount - 1), WINDOWS_FALLBACK_MAX_RETRY_MS);
+function windowsDiscoveryRetryDelayMs(failureCount: number): number {
+  return Math.min(3_000 * 2 ** Math.max(0, failureCount - 1), WINDOWS_DISCOVERY_MAX_RETRY_MS);
 }
 
-function windowsFallbackSuccessDelayMs(elapsedMs: number): number {
+function windowsDiscoveryCostDelayMs(elapsedMs: number): number {
   return Math.min(
     Math.max(Duration.toMillis(POLL_INTERVAL), Math.max(0, elapsedMs) * 4),
-    WINDOWS_FALLBACK_MAX_RETRY_MS,
+    WINDOWS_DISCOVERY_MAX_RETRY_MS,
   );
 }
 
@@ -350,6 +350,7 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
   });
   const webProbeCacheRef = yield* Ref.make<ReadonlyMap<string, WebProbeCacheEntry>>(new Map());
   const scanSemaphore = yield* Semaphore.make(1);
+  const windowsNativeRetryRef = yield* Ref.make({ failureCount: 0, nextAttemptAtMillis: 0 });
   const windowsFallbackRef = yield* Ref.make({
     failureCount: 0,
     nextAttemptAtMillis: 0,
@@ -580,7 +581,7 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       yield* Ref.set(windowsFallbackRef, {
         failureCount: 0,
         nextAttemptAtMillis:
-          completedAtMillis + windowsFallbackSuccessDelayMs(completedAtMillis - startedAtMillis),
+          completedAtMillis + windowsDiscoveryCostDelayMs(completedAtMillis - startedAtMillis),
         lastSnapshot: listeners,
       });
       return listeners;
@@ -590,7 +591,7 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
     const completedAtMillis = yield* Clock.currentTimeMillis;
     yield* Ref.set(windowsFallbackRef, {
       failureCount,
-      nextAttemptAtMillis: completedAtMillis + windowsFallbackRetryDelayMs(failureCount),
+      nextAttemptAtMillis: completedAtMillis + windowsDiscoveryRetryDelayMs(failureCount),
       lastSnapshot: fallback.lastSnapshot,
     });
     return fallback.lastSnapshot === null
@@ -609,14 +610,39 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       }
     }
     if (hostPlatform === "win32") {
-      const nativeListeners = yield* nativeTelemetry.windowsListeners.pipe(
-        Effect.map((listeners) => windowsListenersToServers(listeners, terminalByProcessId)),
-        Effect.catch((error) =>
-          Effect.logDebug("native Windows listener discovery failed; using fallback", {
-            errorTag: error._tag,
-          }).pipe(Effect.as(null)),
-        ),
-      );
+      const startedAtMillis = yield* Clock.currentTimeMillis;
+      const nativeRetry = yield* Ref.get(windowsNativeRetryRef);
+      const nativeListeners =
+        startedAtMillis < nativeRetry.nextAttemptAtMillis
+          ? null
+          : yield* nativeTelemetry.windowsListeners.pipe(
+              Effect.map((listeners) => windowsListenersToServers(listeners, terminalByProcessId)),
+              Effect.tap(() =>
+                Ref.set(windowsNativeRetryRef, { failureCount: 0, nextAttemptAtMillis: 0 }),
+              ),
+              Effect.catch((error) =>
+                Effect.gen(function* () {
+                  const completedAtMillis = yield* Clock.currentTimeMillis;
+                  const failureCount = nativeRetry.failureCount + 1;
+                  yield* Ref.set(windowsNativeRetryRef, {
+                    failureCount,
+                    nextAttemptAtMillis:
+                      completedAtMillis +
+                      Math.max(
+                        windowsDiscoveryRetryDelayMs(failureCount),
+                        windowsDiscoveryCostDelayMs(completedAtMillis - startedAtMillis),
+                      ),
+                  });
+                  yield* Effect.logDebug(
+                    "native Windows listener discovery failed; using fallback",
+                    {
+                      errorTag: error._tag,
+                    },
+                  );
+                  return null;
+                }),
+              ),
+            );
       const listeners =
         nativeListeners === null
           ? yield* probeWindowsFallback(terminalByProcessId)

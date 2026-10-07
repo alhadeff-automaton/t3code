@@ -5,6 +5,7 @@ import {
   CONFIGURED_LOCAL_SERVER_URLS_MAX_ITEMS,
   PREVIEW_URL_MAX_LENGTH,
   type DiscoveredLocalServer,
+  type ResourceMonitorWindowsListener,
 } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Net from "@t3tools/shared/Net";
@@ -17,6 +18,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
+import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
@@ -368,8 +370,9 @@ effectIt.effect("paces a slow successful Windows fallback from completion", () =
     expect(yield* scanner.scan()).toEqual([]);
     expect(fallbackRuns).toBe(1);
     yield* TestClock.adjust("1 millis");
+    fallbackStarted = yield* Deferred.make<void>();
     const secondScan = yield* scanner.scan().pipe(Effect.forkChild);
-    yield* Effect.yieldNow;
+    yield* Deferred.await(fallbackStarted);
     expect(fallbackRuns).toBe(2);
     yield* TestClock.adjust("5 seconds");
     yield* Fiber.join(secondScan);
@@ -424,6 +427,161 @@ effectIt.effect("retains a Windows fallback cooldown across native recovery", ()
     yield* TestClock.adjust("14 seconds");
     expect((yield* scanner.scan())[0]?.port).toBe(LSOF_TEST_PORT);
     expect(fallbackRuns).toBe(2);
+  }).pipe(Effect.provide(layer));
+});
+
+effectIt.effect(
+  "backs off timed-out native Windows requests while serving the retained snapshot",
+  () =>
+    Effect.gen(function* () {
+      const nativeStarted = yield* Deferred.make<void>();
+      const fallbackStarted = yield* Deferred.make<void>();
+      const pending = yield* Ref.make<
+        Map<
+          string,
+          Deferred.Deferred<
+            ReadonlyArray<ResourceMonitorWindowsListener>,
+            NativeTelemetryClient.NativeTelemetryClientError
+          >
+        >
+      >(new Map());
+      let nativeCalls = 0;
+      let fallbackRuns = 0;
+      const layer = makeWindowsScannerLayer({
+        windowsListeners: Effect.suspend(() => {
+          nativeCalls += 1;
+          if (nativeCalls === 1) {
+            return NativeTelemetryClient.runPendingNativeTelemetryRequest({
+              pending,
+              requestId: "unanswered-listeners",
+              operation: "windowsListeners",
+              timeout: Duration.seconds(5),
+              write: Deferred.succeed(nativeStarted, undefined).pipe(Effect.asVoid),
+            });
+          }
+          if (nativeCalls === 2) {
+            return Effect.fail(
+              new NativeTelemetryClient.NativeTelemetryUnavailable({ reason: "test" }),
+            );
+          }
+          return Effect.succeed(
+            nativeCalls === 3 ? [] : [{ port: 43_124, pid: 4_243, processName: "node" }],
+          );
+        }),
+        run: () =>
+          Effect.gen(function* () {
+            fallbackRuns += 1;
+            yield* Deferred.succeed(fallbackStarted, undefined);
+            yield* Effect.sleep("5 seconds");
+            return {
+              stdout: `127.0.0.1|${LSOF_TEST_PORT}|4242|node\n`,
+              stderr: "",
+              code: ChildProcessSpawner.ExitCode(0),
+              timedOut: false,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+              stdoutInvalidUtf8: false,
+              stderrInvalidUtf8: false,
+            };
+          }),
+        fetch: (() =>
+          Promise.resolve(
+            new Response("app", { headers: { "content-type": "text/html" } }),
+          )) as typeof globalThis.fetch,
+      });
+
+      yield* Effect.gen(function* () {
+        const scanner = yield* PortScanner.PortDiscovery;
+        const firstScan = yield* scanner.scan().pipe(Effect.forkChild);
+        yield* Deferred.await(nativeStarted);
+        yield* TestClock.adjust("5 seconds");
+        yield* Deferred.await(fallbackStarted);
+        yield* TestClock.adjust("5 seconds");
+        expect((yield* Fiber.join(firstScan))[0]?.port).toBe(LSOF_TEST_PORT);
+
+        yield* scanner.registerTerminalProcesses({
+          threadId: "thread-1",
+          terminalId: "default",
+          processIds: [4_242],
+        });
+        const [elapsed, snapshots] = yield* Effect.all(
+          [scanner.scan(), scanner.scan(), scanner.scan()],
+          { concurrency: "unbounded" },
+        ).pipe(Effect.timed);
+        expect(Duration.toMillis(elapsed)).toBe(0);
+        expect(nativeCalls).toBe(1);
+        expect(fallbackRuns).toBe(1);
+        for (const snapshot of snapshots) {
+          expect(snapshot[0]?.port).toBe(LSOF_TEST_PORT);
+          expect(snapshot[0]?.terminal).toEqual({ threadId: "thread-1", terminalId: "default" });
+        }
+
+        yield* TestClock.adjust("14999 millis");
+        expect((yield* scanner.scan())[0]?.port).toBe(LSOF_TEST_PORT);
+        expect(nativeCalls).toBe(1);
+        yield* TestClock.adjust("1 millis");
+        expect((yield* scanner.scan())[0]?.port).toBe(LSOF_TEST_PORT);
+        expect(nativeCalls).toBe(2);
+        expect(fallbackRuns).toBe(1);
+
+        yield* TestClock.adjust("6 seconds");
+        expect(yield* scanner.scan()).toEqual([]);
+        expect((yield* scanner.scan())[0]?.port).toBe(43_124);
+        expect(nativeCalls).toBe(4);
+        expect(fallbackRuns).toBe(1);
+      }).pipe(Effect.provide(layer));
+    }),
+);
+
+effectIt.effect("bounds repeated native Windows failures with exponential backoff", () => {
+  let nativeCalls = 0;
+  const layer = makeWindowsScannerLayer({
+    windowsListeners: Effect.suspend(() => {
+      nativeCalls += 1;
+      return Effect.fail(new NativeTelemetryClient.NativeTelemetryUnavailable({ reason: "test" }));
+    }),
+    run: processProbeFailure,
+  });
+
+  return Effect.gen(function* () {
+    const scanner = yield* PortScanner.PortDiscovery;
+    yield* scanner.scan();
+    yield* scanner.scan();
+    expect(nativeCalls).toBe(1);
+    for (const delayMs of [3_000, 6_000, 12_000, 24_000, 48_000, 60_000, 60_000]) {
+      const previousCalls = nativeCalls;
+      yield* TestClock.adjust(Duration.millis(delayMs - 1));
+      yield* scanner.scan();
+      expect(nativeCalls).toBe(previousCalls);
+      yield* TestClock.adjust("1 millis");
+      yield* scanner.scan();
+      expect(nativeCalls).toBe(previousCalls + 1);
+    }
+  }).pipe(Effect.provide(layer));
+});
+
+effectIt.effect("retries native Windows discovery after an interrupted request", () => {
+  let nativeCalls = 0;
+  let fallbackRuns = 0;
+  const layer = makeWindowsScannerLayer({
+    windowsListeners: Effect.suspend(() => {
+      nativeCalls += 1;
+      return nativeCalls === 1 ? Effect.interrupt : Effect.succeed([]);
+    }),
+    run: (input) => {
+      fallbackRuns += 1;
+      return processProbeFailure(input);
+    },
+  });
+
+  return Effect.gen(function* () {
+    const scanner = yield* PortScanner.PortDiscovery;
+    const interrupted = yield* scanner.scan().pipe(Effect.exit);
+    expect(Exit.isFailure(interrupted)).toBe(true);
+    if (Exit.isFailure(interrupted)) expect(Cause.hasInterruptsOnly(interrupted.cause)).toBe(true);
+    expect(yield* scanner.scan()).toEqual([]);
+    expect(nativeCalls).toBe(2);
+    expect(fallbackRuns).toBe(0);
   }).pipe(Effect.provide(layer));
 });
 
