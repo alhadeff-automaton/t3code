@@ -697,6 +697,7 @@ effectIt.live(
       if ((yield* HostProcessPlatform) !== "win32") return context.skip();
       const runner = yield* ProcessRunner.ProcessRunner;
       let rows = [
+        "L'état des connexions TCP",
         "  TCP  127.0.0.1:43123  0.0.0.0:0  ABHÖREN  4242",
         "  TCP  [::]:43124  [::]:0  LISTENING  4242",
         "  TCP  [::1]:43124  [::]:0  ÉCOUTE  4242",
@@ -712,7 +713,7 @@ effectIt.live(
             ...input,
             args: [
               ...input.args.slice(0, 3),
-              `function Get-NetTCPConnection { throw 'CIM must not run' }; function Get-Process { [pscustomobject]@{ Id=4242; ProcessName='node' } }; function netstat.exe { $global:LASTEXITCODE=${exitCode}; '${rows}' -split '\n' }; ${input.args[3]}`,
+              `function Get-NetTCPConnection { throw 'CIM must not run' }; function Get-Process { [pscustomobject]@{ Id=4242; ProcessName='node' } }; function netstat.exe { $global:LASTEXITCODE=${exitCode}; '${rows.replaceAll("'", "''")}' -split '\n' }; ${input.args[3]}`,
             ],
           }),
         (() =>
